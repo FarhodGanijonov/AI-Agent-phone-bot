@@ -1,14 +1,13 @@
 import asyncio
-import google.generativeai as genai
+import json
+import httpx
 from sqlalchemy import and_
 
 from app.config import GEMINI_API_KEY
 from app.db import SessionLocal, Phone
 from app.cache import get_cached, set_cached
 
-genai.configure(api_key=GEMINI_API_KEY)
-MODEL = "gemini-1.5-flash"
-MAX_TOOL_ITERATIONS = 5
+GEMINI_URL = "https://plain-cake-eb2b.abdurazoqovolloyor571.workers.dev/gemini-2.5-flash"
 
 SYSTEM_PROMPT = (
     "Sen telefon do'koni uchun yordamchi AI-agentsan. Foydalanuvchi o'zbek yoki rus tilida "
@@ -18,24 +17,24 @@ SYSTEM_PROMPT = (
     "buni aytib, mezonlarni yumshatishni taklif qil."
 )
 
-SEARCH_TOOL_GEMINI = genai.protos.Tool(
-    function_declarations=[
-        genai.protos.FunctionDeclaration(
-            name="search_phones",
-            description="Bazadan telefonlarni narx, RAM, xotira yoki brend bo'yicha filtrlab qidiradi.",
-            parameters=genai.protos.Schema(
-                type=genai.protos.Type.OBJECT,
-                properties={
-                    "min_price": genai.protos.Schema(type=genai.protos.Type.NUMBER, description="Minimal narx (USD)"),
-                    "max_price": genai.protos.Schema(type=genai.protos.Type.NUMBER, description="Maksimal narx (USD)"),
-                    "brand": genai.protos.Schema(type=genai.protos.Type.STRING, description="Brend nomi, masalan Samsung, Xiaomi, Apple"),
-                    "min_camera_mp": genai.protos.Schema(type=genai.protos.Type.NUMBER, description="Minimal kamera megapikseli"),
-                    "min_ram_gb": genai.protos.Schema(type=genai.protos.Type.NUMBER, description="Minimal RAM (GB)"),
-                },
-            ),
-        )
-    ]
-)
+TOOLS = [{
+    "function_declarations": [{
+        "name": "search_phones",
+        "description": "Bazadan telefonlarni narx, RAM yoki brend bo'yicha filtrlab qidiradi.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "min_price": {"type": "NUMBER", "description": "Minimal narx (USD)"},
+                "max_price": {"type": "NUMBER", "description": "Maksimal narx (USD)"},
+                "brand": {"type": "STRING", "description": "Brend nomi"},
+                "min_camera_mp": {"type": "NUMBER", "description": "Minimal kamera MP"},
+                "min_ram_gb": {"type": "NUMBER", "description": "Minimal RAM (GB)"},
+            },
+        },
+    }]
+}]
+
+MAX_TOOL_ITERATIONS = 5
 
 
 def _search_phones_sync(min_price=None, max_price=None, brand=None, min_camera_mp=None, min_ram_gb=None):
@@ -52,12 +51,10 @@ def _search_phones_sync(min_price=None, max_price=None, brand=None, min_camera_m
             filters.append(Phone.camera_mp >= min_camera_mp)
         if min_ram_gb is not None:
             filters.append(Phone.ram_gb >= min_ram_gb)
-
         query = db.query(Phone)
         if filters:
             query = query.filter(and_(*filters))
-        results = query.limit(8).all()
-        return [r.to_text() for r in results]
+        return [r.to_text() for r in query.limit(8).all()]
     finally:
         db.close()
 
@@ -66,47 +63,68 @@ async def search_phones(**params) -> list:
     cached = await get_cached("search_phones", params)
     if cached is not None:
         return cached
-
     results = await asyncio.to_thread(_search_phones_sync, **params)
     await set_cached("search_phones", params, results)
     return results
 
 
 async def ask_agent(user_message: str) -> str:
-    model = genai.GenerativeModel(
-        model_name=MODEL,
-        system_instruction=SYSTEM_PROMPT,
-        tools=[SEARCH_TOOL_GEMINI],
-    )
+    contents = [
+        {"role": "user", "parts": [{"text": SYSTEM_PROMPT}]},
+        {"role": "model", "parts": [{"text": "Tushunarli, yordam beraman!"}]},
+        {"role": "user", "parts": [{"text": user_message}]},
+    ]
 
-    chat = model.start_chat(history=[])
-    response = await asyncio.to_thread(chat.send_message, user_message)
+    payload = {
+        "contents": contents,
+        "tools": TOOLS,
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024},
+    }
 
-    iterations = 0
-    while True:
-        iterations += 1
-        if iterations > MAX_TOOL_ITERATIONS:
-            return "Kechirasiz, so'rovni qayta ishlab bo'lmadi. Iltimos, savolingizni soddalashtirib qayta yozing."
+    async with httpx.AsyncClient(timeout=60) as client:
+        iterations = 0
+        while iterations < MAX_TOOL_ITERATIONS:
+            iterations += 1
 
-        tool_call = None
-        for part in response.parts:
-            if hasattr(part, "function_call") and part.function_call.name:
-                tool_call = part.function_call
-                break
-
-        if tool_call is None:
-            break
-
-        params = dict(tool_call.args)
-        results = await search_phones(**params)
-
-        tool_response = genai.protos.Part(
-            function_response=genai.protos.FunctionResponse(
-                name=tool_call.name,
-                response={"result": results if results else ["Hech narsa topilmadi."]},
+            response = await client.post(
+                f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+                json=payload,
             )
-        )
-        response = await asyncio.to_thread(chat.send_message, tool_response)
+            data = response.json()
 
-    text = "".join(part.text for part in response.parts if hasattr(part, "text"))
-    return text if text else "Kechirasiz, javob shakllantirib bo'lmadi."
+            candidate = data["candidates"][0]["content"]
+            contents.append(candidate)
+            payload["contents"] = contents
+
+            # Tool chaqiruvini tekshirish
+            tool_call = None
+            for part in candidate.get("parts", []):
+                if "functionCall" in part:
+                    tool_call = part["functionCall"]
+                    break
+
+            if tool_call is None:
+                # Yakuniy javob
+                text = "".join(
+                    p.get("text", "") for p in candidate.get("parts", [])
+                )
+                return text if text.strip() else "Kechirasiz, javob shakllantirib bo'lmadi."
+
+            # Tool natijasini olish va qaytarish
+            params = tool_call.get("args", {})
+            results = await search_phones(**params)
+
+            contents.append({
+                "role": "user",
+                "parts": [{
+                    "functionResponse": {
+                        "name": tool_call["name"],
+                        "response": {
+                            "result": results if results else ["Hech narsa topilmadi."]
+                        },
+                    }
+                }],
+            })
+            payload["contents"] = contents
+
+    return "Kechirasiz, so'rovni qayta ishlab bo'lmadi."
