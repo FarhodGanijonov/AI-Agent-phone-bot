@@ -3,11 +3,9 @@ import json
 import httpx
 from sqlalchemy import and_
 
-from app.config import GEMINI_API_KEY
+from app.config import GEMINI_API_KEY, GEMINI_URL
 from app.db import SessionLocal, Phone
 from app.cache import get_cached, set_cached
-
-GEMINI_URL = "https://plain-cake-eb2b.abdurazoqovolloyor571.workers.dev/gemini-2.5-flash"
 
 SYSTEM_PROMPT = (
     "Sen telefon do'koni uchun yordamchi AI-agentsan. Foydalanuvchi o'zbek yoki rus tilida "
