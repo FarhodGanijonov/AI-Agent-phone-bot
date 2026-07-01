@@ -16,8 +16,8 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    ports:
-      - "6379:6379"
+#    ports:
+#      - "6379:6379"
 
   bot:
     build: .
