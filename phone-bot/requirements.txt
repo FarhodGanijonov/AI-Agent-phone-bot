@@ -1,6 +1,6 @@
 python-telegram-bot==21.4
 SQLAlchemy==2.0.32
 psycopg2-binary==2.9.9
-anthropic==0.34.2
+google-generativeai==0.7.2
 python-dotenv==1.0.1
 redis==5.0.8

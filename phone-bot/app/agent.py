@@ -1,56 +1,44 @@
-"""
-AI agent: foydalanuvchi tabiiy tilda yozadi (masalan
-"200 dollar atrofida kamerasi yaxshi telefon kerak"),
-LLM buni tool-call orqali bazadan filtrlab, natijani
-tabiiy tilda izohlab beradi.
-
-Performance eslatmalari:
-- AsyncAnthropic ishlatiladi, shunda LLM javobini kutish paytida
-  event loop boshqa foydalanuvchilarning xabarlarini parallel qayta ishlay oladi.
-- search_phones natijalari Redis'da keshlanadi — bir xil filtrlar bilan
-  qaytadan DB so'ralmaydi.
-- Sinxron SQLAlchemy chaqiruvi asyncio.to_thread orqali alohida
-  thread'da bajariladi, shunda event loop bloklanmaydi.
-"""
 import asyncio
-import json
-from anthropic import AsyncAnthropic
+import google.generativeai as genai
 from sqlalchemy import and_
 
-from app.config import ANTHROPIC_API_KEY
+from app.config import GEMINI_API_KEY
 from app.db import SessionLocal, Phone
 from app.cache import get_cached, set_cached
 
-client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-MODEL = "claude-sonnet-4-6"
-MAX_TOOL_ITERATIONS = 5  # cheksiz tsikldan himoya
-
-SEARCH_TOOL = {
-    "name": "search_phones",
-    "description": "Bazadan telefonlarni narx, RAM, xotira yoki brend bo'yicha filtrlab qidiradi.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "min_price": {"type": "number", "description": "Minimal narx (USD)"},
-            "max_price": {"type": "number", "description": "Maksimal narx (USD)"},
-            "brand": {"type": "string", "description": "Brend nomi, masalan Samsung, Xiaomi, Apple"},
-            "min_camera_mp": {"type": "number", "description": "Minimal kamera megapikseli"},
-            "min_ram_gb": {"type": "number", "description": "Minimal RAM (GB)"},
-        },
-    },
-}
+genai.configure(api_key=GEMINI_API_KEY)
+MODEL = "gemini-1.5-flash"
+MAX_TOOL_ITERATIONS = 5
 
 SYSTEM_PROMPT = (
     "Sen telefon do'koni uchun yordamchi AI-agentsan. Foydalanuvchi o'zbek yoki rus tilida "
     "telefon haqida so'rov beradi (narx, kamera, brend va h.k.). Har doim avval "
-    "search_phones tool'ini chaqirib bazadan mos telefonlarni top, so'ng natijalarni "
+    "search_phones funksiyasini chaqirib bazadan mos telefonlarni top, so'ng natijalarni "
     "qisqa va do'stona tarzda, narxlari bilan birga taklif qil. Agar hech narsa topilmasa, "
     "buni aytib, mezonlarni yumshatishni taklif qil."
 )
 
+SEARCH_TOOL_GEMINI = genai.protos.Tool(
+    function_declarations=[
+        genai.protos.FunctionDeclaration(
+            name="search_phones",
+            description="Bazadan telefonlarni narx, RAM, xotira yoki brend bo'yicha filtrlab qidiradi.",
+            parameters=genai.protos.Schema(
+                type=genai.protos.Type.OBJECT,
+                properties={
+                    "min_price": genai.protos.Schema(type=genai.protos.Type.NUMBER, description="Minimal narx (USD)"),
+                    "max_price": genai.protos.Schema(type=genai.protos.Type.NUMBER, description="Maksimal narx (USD)"),
+                    "brand": genai.protos.Schema(type=genai.protos.Type.STRING, description="Brend nomi, masalan Samsung, Xiaomi, Apple"),
+                    "min_camera_mp": genai.protos.Schema(type=genai.protos.Type.NUMBER, description="Minimal kamera megapikseli"),
+                    "min_ram_gb": genai.protos.Schema(type=genai.protos.Type.NUMBER, description="Minimal RAM (GB)"),
+                },
+            ),
+        )
+    ]
+)
+
 
 def _search_phones_sync(min_price=None, max_price=None, brand=None, min_camera_mp=None, min_ram_gb=None):
-    """Bloklovchi (sync) DB so'rovi — alohida thread'da chaqiriladi."""
     db = SessionLocal()
     try:
         filters = []
@@ -79,52 +67,46 @@ async def search_phones(**params) -> list:
     if cached is not None:
         return cached
 
-    # Sync SQLAlchemy chaqiruvini event loopni bloklamasdan bajaramiz.
     results = await asyncio.to_thread(_search_phones_sync, **params)
-
     await set_cached("search_phones", params, results)
     return results
 
 
 async def ask_agent(user_message: str) -> str:
-    messages = [{"role": "user", "content": user_message}]
-
-    response = await client.messages.create(
-        model=MODEL,
-        max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        tools=[SEARCH_TOOL],
-        messages=messages,
+    model = genai.GenerativeModel(
+        model_name=MODEL,
+        system_instruction=SYSTEM_PROMPT,
+        tools=[SEARCH_TOOL_GEMINI],
     )
 
-    # Agar LLM tool chaqirsa — bazani so'raymiz va natijani qaytaramiz
+    chat = model.start_chat(history=[])
+    response = await asyncio.to_thread(chat.send_message, user_message)
+
     iterations = 0
-    while response.stop_reason == "tool_use":
+    while True:
         iterations += 1
         if iterations > MAX_TOOL_ITERATIONS:
             return "Kechirasiz, so'rovni qayta ishlab bo'lmadi. Iltimos, savolingizni soddalashtirib qayta yozing."
 
-        tool_use_block = next(b for b in response.content if b.type == "tool_use")
-        tool_input = tool_use_block.input
-        results = await search_phones(**tool_input)
+        tool_call = None
+        for part in response.parts:
+            if hasattr(part, "function_call") and part.function_call.name:
+                tool_call = part.function_call
+                break
 
-        messages.append({"role": "assistant", "content": response.content})
-        messages.append({
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": tool_use_block.id,
-                "content": json.dumps(results, ensure_ascii=False) if results else "Hech narsa topilmadi.",
-            }],
-        })
+        if tool_call is None:
+            break
 
-        response = await client.messages.create(
-            model=MODEL,
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            tools=[SEARCH_TOOL],
-            messages=messages,
+        params = dict(tool_call.args)
+        results = await search_phones(**params)
+
+        tool_response = genai.protos.Part(
+            function_response=genai.protos.FunctionResponse(
+                name=tool_call.name,
+                response={"result": results if results else ["Hech narsa topilmadi."]},
+            )
         )
+        response = await asyncio.to_thread(chat.send_message, tool_response)
 
-    text_blocks = [b.text for b in response.content if b.type == "text"]
-    return "\n".join(text_blocks) if text_blocks else "Kechirasiz, javob shakllantirib bo'lmadi."
+    text = "".join(part.text for part in response.parts if hasattr(part, "text"))
+    return text if text else "Kechirasiz, javob shakllantirib bo'lmadi."
